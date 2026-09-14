@@ -914,6 +914,27 @@ esp_err_t initialise_wifi(void)
         return result;
     }
 
+    /*
+     * WST-14: Disable Wi-Fi modem power save.
+     *
+     * esp_wifi_init() leaves power save at the esp-idf default of
+     * WIFI_PS_MIN_MODEM, in which the radio sleeps between DTIM beacons and
+     * only wakes each DTIM period. On a NIGHTWAVE camera acting as a station
+     * this collapses usable throughput to ~2 Mb/s even at -28 dBm (measured),
+     * far below the highres RTSP stream, producing frozen / heavily pixelated
+     * video. Power save cannot be turned off from the SDIO host
+     * (`iw ... set power_save off` returns -EOPNOTSUPP and the host driver
+     * exposes no PS command), so it must be disabled here in firmware.
+     *
+     * WIFI_PS_NONE keeps the receiver on continuously. This raises idle draw,
+     * which is acceptable for a mains/PoE-class camera streaming video.
+     */
+    result = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to disable Wi-Fi power save: %d", result);
+        return result;
+    }
+
     esp_wifi_set_debug_log();
 
     /* Register callback functions with wifi driver */
