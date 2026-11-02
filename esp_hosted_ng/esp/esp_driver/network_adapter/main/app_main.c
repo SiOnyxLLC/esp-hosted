@@ -500,6 +500,51 @@ void process_priv_commamd(uint8_t if_type, uint8_t *payload, uint16_t payload_le
 	}
 }
 
+/*
+ * WST-25: host->WiFi TX with back-pressure and drop accounting.
+ *
+ * Upstream calls esp_wifi_internal_tx() once and (for the STA path) ignores
+ * the return value, so ESP_ERR_NO_MEM -- the WiFi TX buffer pool momentarily
+ * full -- silently drops the frame while the SDIO buffer is freed and the host
+ * believes it was sent. On a NIGHTWAVE camera this showed as a hard ~3 Mb/s
+ * ceiling with an idle MCS7 radio and RTP "missed N packets". Retry briefly
+ * (1 ms ticks, bounded) instead of dropping, and count outcomes so the real
+ * drop rate is visible in the UART log.
+ */
+static uint32_t wtx_ok = 0, wtx_nomem_retries = 0, wtx_dropped = 0, wtx_err = 0;
+#define WTX_MAX_NOMEM_RETRIES 40   /* ~40 ms worst case per frame */
+
+static void wifi_tx_backpressure(wifi_interface_t iface, void *payload, uint16_t len)
+{
+	int ret;
+	int tries = 0;
+
+	for (;;) {
+		ret = esp_wifi_internal_tx(iface, payload, len);
+		if (ret == ESP_OK) {
+			wtx_ok++;
+			break;
+		}
+		if (ret == ESP_ERR_NO_MEM && tries < WTX_MAX_NOMEM_RETRIES) {
+			tries++;
+			wtx_nomem_retries++;
+			vTaskDelay(1);
+			continue;
+		}
+		if (ret == ESP_ERR_NO_MEM)
+			wtx_dropped++;
+		else
+			wtx_err++;
+		break;
+	}
+
+	if (((wtx_ok + wtx_dropped + wtx_err) % 2000) == 0) {
+		ESP_LOGI(TAG, "WTX ok=%lu nomem_retries=%lu dropped=%lu err=%lu",
+			 (unsigned long)wtx_ok, (unsigned long)wtx_nomem_retries,
+			 (unsigned long)wtx_dropped, (unsigned long)wtx_err);
+	}
+}
+
 void process_rx_pkt(interface_buffer_handle_t *buf_handle)
 {
 	struct esp_payload_header *header = NULL;
@@ -530,16 +575,14 @@ void process_rx_pkt(interface_buffer_handle_t *buf_handle)
 			/* Forward packet over station interface */
 			if (station_connected || association_ongoing) {
 				/*ESP_LOGI(TAG, "Send wlan\n");*/
-				esp_wifi_internal_tx(ESP_IF_WIFI_STA, payload, payload_len);
+				wifi_tx_backpressure(ESP_IF_WIFI_STA, payload, payload_len);
 			}
 
 		} else if (buf_handle->if_type == ESP_AP_IF && softap_started) {
 
 			/* Forward packet over soft AP interface */
 			/* ESP_LOGI(TAG, "Send data pkt over wlan\n"); */
-			int ret = esp_wifi_internal_tx(ESP_IF_WIFI_AP, payload, payload_len);
-			if (ret)
-				ESP_LOGE(TAG, "Sending data failed=%d\n", ret);
+			wifi_tx_backpressure(ESP_IF_WIFI_AP, payload, payload_len);
 		}
 #if defined(CONFIG_BT_ENABLED) && BLUETOOTH_HCI
 		else if (buf_handle->if_type == ESP_HCI_IF) {
