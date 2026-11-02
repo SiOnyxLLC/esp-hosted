@@ -38,6 +38,7 @@
 #include "freertos/queue.h"
 #ifdef CONFIG_BT_ENABLED
 #include "esp_bt.h"
+#include "esp_coexist.h"
 #ifdef CONFIG_BT_HCI_UART_NO
 #include "driver/uart.h"
 #endif
@@ -685,6 +686,14 @@ void app_main()
 
 #ifdef CONFIG_BT_ENABLED
 	initialise_bluetooth();
+
+	/*
+	 * KBU T3 V3 (design Option D) TEST BUILD ONLY. Caution: in IDF v5.1.3 the ESP32-C6
+	 * libcoexist.a coex_preference_set() disassembles to `li a0,0; ret`, i.e. this call is
+	 * a no-op that returns ESP_OK. Built only because T3 asks for it; see the T3 report.
+	 */
+	ret = esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+	ESP_LOGW(TAG, "T3: esp_coex_preference_set(ESP_COEX_PREFER_WIFI) = %s", esp_err_to_name(ret));
 
 	ret = esp_read_mac(mac, ESP_MAC_BT);
 	if (ret) {
