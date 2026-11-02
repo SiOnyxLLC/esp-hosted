@@ -654,6 +654,61 @@ static void set_gpio_cd_pin(void)
 #endif
 }
 
+#if defined(CONFIG_BT_ENABLED)
+/*
+ * KBU T3 TEST BUILD ONLY -- not for production. Answers one question on hardware:
+ * does esp_bt_controller_disable() at runtime (coex stays initialised) give back the
+ * Wi-Fi throughput that CONFIG_BT_ENABLED=n gives?
+ *
+ * Fixed schedule, anchored at the FIRST SoftAP start (softap_started 0->1), so the windows
+ * line up with the measurement session rather than with ESP32 power-on:
+ *   [0, T3_BT_ON_FIRST_S)                    BT controller enabled (as booted)
+ *   [T3_BT_ON_FIRST_S, +T3_BT_OFF_S)         esp_bt_controller_disable()
+ *   [T3_BT_ON_FIRST_S + T3_BT_OFF_S, reboot) esp_bt_controller_enable(ESP_BT_MODE_BLE)
+ *
+ * disable()/enable() only. Never deinit(): init-after-deinit is unsupported on C6
+ * (esp_bt.h, IDF v5.1.3), and esp_bt_mem_release() is irreversible.
+ * While disabled, IDF's esp_vhci_host_send_packet() drops host->controller HCI packets
+ * (bt.c checks ble_controller_status), so BlueZ commands sent in that window time out.
+ */
+#include "esp_timer.h"
+#ifndef T3_BT_ON_FIRST_S
+#define T3_BT_ON_FIRST_S	900
+#endif
+#ifndef T3_BT_OFF_S
+#define T3_BT_OFF_S		900
+#endif
+
+static void t3_bt_toggle_task(void *arg)
+{
+	int64_t t0;
+	esp_err_t r;
+
+	while (!softap_started)
+		vTaskDelay(pdMS_TO_TICKS(100));
+	t0 = esp_timer_get_time();
+	ESP_LOGW(TAG, "T3: SoftAP up at %lld ms since boot; BT controller disable in %d s, re-enable %d s later; heap free %lu min %lu",
+			t0 / 1000, T3_BT_ON_FIRST_S, T3_BT_OFF_S,
+			(unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
+
+	vTaskDelay(pdMS_TO_TICKS(T3_BT_ON_FIRST_S * 1000));
+	r = esp_bt_controller_disable();
+	ESP_LOGW(TAG, "T3: esp_bt_controller_disable() = %s, status %d, t+%lld s; heap free %lu min %lu",
+			esp_err_to_name(r), esp_bt_controller_get_status(),
+			(esp_timer_get_time() - t0) / 1000000,
+			(unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
+
+	vTaskDelay(pdMS_TO_TICKS(T3_BT_OFF_S * 1000));
+	r = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+	ESP_LOGW(TAG, "T3: esp_bt_controller_enable(BLE) = %s, status %d, t+%lld s; heap free %lu min %lu",
+			esp_err_to_name(r), esp_bt_controller_get_status(),
+			(esp_timer_get_time() - t0) / 1000000,
+			(unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
+
+	vTaskDelete(NULL);
+}
+#endif
+
 void app_main()
 {
 	esp_err_t ret;
@@ -731,5 +786,8 @@ void app_main()
 		send_bootup_event_to_host(capa);
 
 	debug_set_wifi_logging();
+#if defined(CONFIG_BT_ENABLED)
+	assert(xTaskCreate(t3_bt_toggle_task, "t3_bt_toggle", 4096, NULL, TASK_DEFAULT_PRIO, NULL) == pdTRUE);
+#endif
 	ESP_LOGI(TAG,"Initial set up done");
 }
