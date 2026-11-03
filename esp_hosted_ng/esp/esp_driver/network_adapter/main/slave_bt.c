@@ -46,11 +46,22 @@ static void controller_rcv_pkt_ready(void)
 		xSemaphoreGive(vhci_send_sem);
 }
 
+/* Set just before a runtime esp_bt_controller_enable(): the controller then announces itself with
+ * a Command Complete for opcode 0x0000 (no command). Swallow that one event, so the host sees exactly
+ * one Command Complete for its 0xFFA0 switch command (hcitool otherwise takes the NOP as the reply). */
+static volatile bool bt_swallow_nop_cc;
+
 static int host_rcv_pkt(uint8_t *data, uint16_t len)
 {
 	esp_err_t ret = ESP_OK;
 	interface_buffer_handle_t buf_handle;
 	uint8_t *buf = NULL;
+
+	if (bt_swallow_nop_cc && len >= 6 && data[0] == 0x04 && data[1] == 0x0E &&
+	    data[4] == 0x00 && data[5] == 0x00) {
+		bt_swallow_nop_cc = false;
+		return 0;
+	}
 
 	buf = (uint8_t *) malloc(len);
 
@@ -138,6 +149,7 @@ static void bt_switch_handle(uint16_t opcode, const uint8_t *param, uint8_t plen
 		if (r == ESP_OK)
 			bt_runtime_off = true;
 	} else if (param[0] == 1 && esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED) {
+		bt_swallow_nop_cc = true;
 		r = esp_bt_controller_enable(ESP_BT_MODE_BLE);
 		if (r == ESP_OK)
 			bt_runtime_off = false;
@@ -180,6 +192,8 @@ void process_hci_rx_pkt(uint8_t *payload, uint16_t payload_len) {
 	/* payload[0] = H4 packet type; a command is opcode(2) + plen(1) + params */
 	if (payload[0] == HCI_H4_CMD && payload_len >= 4) {
 		uint16_t opcode = payload[1] | (payload[2] << 8);
+
+		bt_swallow_nop_cc = false;	/* only the NOP right after our own enable is swallowed */
 
 		if (opcode == SNX_VS_BT_SWITCH_OPCODE) {
 			bt_switch_handle(opcode, &payload[4], payload_len - 4 < payload[3] ? payload_len - 4 : payload[3]);
