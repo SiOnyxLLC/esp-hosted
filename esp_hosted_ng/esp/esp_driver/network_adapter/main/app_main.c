@@ -673,10 +673,10 @@ static void set_gpio_cd_pin(void)
  */
 #include "esp_timer.h"
 #ifndef T3_BT_ON_FIRST_S
-#define T3_BT_ON_FIRST_S	900
+#define T3_BT_ON_FIRST_S	480
 #endif
 #ifndef T3_BT_OFF_S
-#define T3_BT_OFF_S		900
+#define T3_BT_OFF_S		420
 #endif
 
 static void t3_bt_toggle_task(void *arg)
