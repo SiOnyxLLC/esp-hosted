@@ -660,8 +660,8 @@ static void set_gpio_cd_pin(void)
  * does esp_bt_controller_disable() at runtime (coex stays initialised) give back the
  * Wi-Fi throughput that CONFIG_BT_ENABLED=n gives?
  *
- * Fixed schedule, anchored at the FIRST SoftAP start (softap_started 0->1), so the windows
- * line up with the measurement session rather than with ESP32 power-on:
+ * Fixed schedule, anchored at the first time Wi-Fi is up in either role (SoftAP started or
+ * station connected), so the windows line up with the measurement session, not ESP32 power-on:
  *   [0, T3_BT_ON_FIRST_S)                    BT controller enabled (as booted)
  *   [T3_BT_ON_FIRST_S, +T3_BT_OFF_S)         esp_bt_controller_disable()
  *   [T3_BT_ON_FIRST_S + T3_BT_OFF_S, reboot) esp_bt_controller_enable(ESP_BT_MODE_BLE)
@@ -684,11 +684,11 @@ static void t3_bt_toggle_task(void *arg)
 	int64_t t0;
 	esp_err_t r;
 
-	while (!softap_started)
+	while (!softap_started && !station_connected)
 		vTaskDelay(pdMS_TO_TICKS(100));
 	t0 = esp_timer_get_time();
-	ESP_LOGW(TAG, "T3: SoftAP up at %lld ms since boot; BT controller disable in %d s, re-enable %d s later; heap free %lu min %lu",
-			t0 / 1000, T3_BT_ON_FIRST_S, T3_BT_OFF_S,
+	ESP_LOGW(TAG, "T3: Wi-Fi up (ap=%d sta=%d) at %lld ms since boot; BT controller disable in %d s, re-enable %d s later; heap free %lu min %lu",
+			softap_started, station_connected, t0 / 1000, T3_BT_ON_FIRST_S, T3_BT_OFF_S,
 			(unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
 
 	vTaskDelay(pdMS_TO_TICKS(T3_BT_ON_FIRST_S * 1000));
