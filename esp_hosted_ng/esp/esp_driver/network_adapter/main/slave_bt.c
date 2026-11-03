@@ -21,6 +21,7 @@
 #include "soc/lldesc.h"
 #include "esp_bt.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "slave_bt.h"
 
 #if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S3)
@@ -88,6 +89,85 @@ static esp_vhci_host_callback_t vhci_host_cb = {
 	host_rcv_pkt
 };
 
+/*
+ * Runtime BT controller switch, driven by the host over the existing HCI channel (no SDIO
+ * protocol or host-driver change; esp_fw_version.h untouched, so the host still matches
+ * NG-1.0.3.0.1).
+ *
+ * HCI vendor command 0xFFA0 (OGF 0x3F, OCF 0x3A0), one parameter byte:
+ *   0x00 = esp_bt_controller_disable()   0x01 = esp_bt_controller_enable(ESP_BT_MODE_BLE)
+ *   0x02 = query only
+ * Reply: Command Complete, return parameters = status (0x00 ok, 0x12 bad parameter,
+ * 0x1F unspecified error) and esp_bt_controller_status_t after the operation (1 off, 2 on).
+ *   e.g. from the host:  hcitool -i hci0 cmd 0x3f 0x3a0 00
+ *
+ * disable()/enable() only, never deinit(): init-after-deinit is unsupported on C6 (esp_bt.h),
+ * and esp_bt_mem_release() is irreversible. disable() leaves coex initialised (Wi-Fi owns it).
+ * While the controller is off, every other HCI command is answered at once with Command Status
+ * 0x0C (Command Disallowed) instead of timing out on the host, and ACL data is dropped.
+ * The controller restarts with no host state: after "on" the host must re-run its BLE setup
+ * (on KL730: systemctl restart sips-bluetooth).
+ */
+#define HCI_H4_CMD			0x01
+#define HCI_H4_EVT			0x04
+#define HCI_EV_CMD_COMPLETE		0x0E
+#define HCI_EV_CMD_STATUS		0x0F
+#define SNX_VS_BT_SWITCH_OPCODE		0xFFA0
+#define HCI_ERR_CMD_DISALLOWED		0x0C
+#define HCI_ERR_INVALID_PARAM		0x12
+#define HCI_ERR_UNSPECIFIED		0x1F
+
+static volatile bool bt_runtime_off;
+
+static void hci_reply_to_host(uint8_t *ev, uint16_t len)
+{
+	if (host_rcv_pkt(ev, len))
+		ESP_LOGE(BT_TAG, "BT switch: could not queue HCI event to host");
+}
+
+static void bt_switch_handle(uint16_t opcode, const uint8_t *param, uint8_t plen)
+{
+	uint8_t status = 0;
+	esp_err_t r = ESP_OK;
+	uint8_t ev[8];
+
+	if (plen < 1 || param[0] > 2) {
+		status = HCI_ERR_INVALID_PARAM;
+	} else if (param[0] == 0 && esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+		r = esp_bt_controller_disable();
+		if (r == ESP_OK)
+			bt_runtime_off = true;
+	} else if (param[0] == 1 && esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED) {
+		r = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+		if (r == ESP_OK)
+			bt_runtime_off = false;
+	}
+	if (r != ESP_OK)
+		status = HCI_ERR_UNSPECIFIED;
+
+	ESP_LOGW(BT_TAG, "BT switch op %d -> %s, controller status %d, heap free %lu min %lu",
+			plen ? param[0] : -1, esp_err_to_name(r), esp_bt_controller_get_status(),
+			(unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
+
+	ev[0] = HCI_H4_EVT;
+	ev[1] = HCI_EV_CMD_COMPLETE;
+	ev[2] = 5;			/* plen */
+	ev[3] = 1;			/* Num_HCI_Command_Packets */
+	ev[4] = opcode & 0xff;
+	ev[5] = opcode >> 8;
+	ev[6] = status;
+	ev[7] = (uint8_t)esp_bt_controller_get_status();
+	hci_reply_to_host(ev, sizeof(ev));
+}
+
+static void hci_reply_disallowed(uint16_t opcode)
+{
+	uint8_t ev[] = { HCI_H4_EVT, HCI_EV_CMD_STATUS, 4, HCI_ERR_CMD_DISALLOWED, 1,
+			 opcode & 0xff, opcode >> 8 };
+
+	hci_reply_to_host(ev, sizeof(ev));
+}
+
 void process_hci_rx_pkt(uint8_t *payload, uint16_t payload_len) {
 	/* VHCI needs one extra byte at the start of payload */
 	/* that is accomodated in esp_payload_header */
@@ -96,6 +176,22 @@ void process_hci_rx_pkt(uint8_t *payload, uint16_t payload_len) {
 #endif
 	payload--;
 	payload_len++;
+
+	/* payload[0] = H4 packet type; a command is opcode(2) + plen(1) + params */
+	if (payload[0] == HCI_H4_CMD && payload_len >= 4) {
+		uint16_t opcode = payload[1] | (payload[2] << 8);
+
+		if (opcode == SNX_VS_BT_SWITCH_OPCODE) {
+			bt_switch_handle(opcode, &payload[4], payload_len - 4 < payload[3] ? payload_len - 4 : payload[3]);
+			return;
+		}
+		if (bt_runtime_off) {
+			hci_reply_disallowed(opcode);
+			return;
+		}
+	}
+	if (bt_runtime_off)
+		return;		/* ACL while the controller is off: drop */
 
 	if (!esp_vhci_host_check_send_available()) {
 		ESP_LOGD(BT_TAG, "VHCI not available");
